@@ -35,7 +35,7 @@ jobs:
         run: |
           cd out
           ISO=leafos-5.0-amd64.iso
-          sudo chown "$(id -u)" "$ISO"
+          sudo chown -R "$(id -u)" .
           sha256sum "$ISO" > "$ISO.sha256"
           if [ "$(stat -c %s "$ISO")" -gt 2000000000 ]; then
             split -b 1900m -d -a 1 "$ISO" "$ISO.part"
