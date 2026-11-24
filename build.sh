@@ -1,12 +1,12 @@
 #!/bin/bash
 # =============================================================================
-#  Leaf OS 3.0 ISO builder
+#  Leaf OS 4.5 ISO builder
 #  Builds a bootable live ISO (Debian 12 + Chromium kiosk) that starts straight
 #  into the Leaf OS desktop with working internet.
 #
 #  Run inside a Debian 12 container (works on Linux, Windows and macOS):
 #     docker run --rm --privileged -v "$PWD":/build -w /build debian:bookworm bash ./build.sh
-#  Result: out/leafos-3.0-amd64.iso
+#  Result: out/leafos-4.5-amd64.iso
 # =============================================================================
 set -euo pipefail
 
@@ -15,10 +15,23 @@ KEYBOARD="${KEYBOARD:-gb}"                 # keyboard layout: gb, us, es, fr, de
 TIMEZONE="${TIMEZONE:-Europe/Madrid}"      # time zone
 LOCALE="${LOCALE:-en_US.UTF-8}"            # system language
 SCREEN="${SCREEN:-1280x800}"               # preferred screen size inside the VM
+VERSION="4.5"
 # -----------------------------------------------------------------------------
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 export DEBIAN_FRONTEND=noninteractive
+
+# Finds a Leaf OS file whether it was uploaded into leafos/ or next to build.sh
+pick() {
+    for f in "$ROOT/$1" "$ROOT/leafos/$1" "$ROOT/leafos/helper/$1" "$ROOT/helper/$1"; do
+        if [ -e "$f" ]; then echo "$f"; return 0; fi
+    done
+    echo "Missing file: $1 (put it in the leafos folder)" >&2
+    return 1
+}
+for f in index.html server.py iso-extra.js manifest.json background.js content.js; do
+    pick "$f" >/dev/null
+done
 
 echo "==> Installing live-build"
 apt-get update
@@ -40,9 +53,9 @@ lb config \
   --apt-recommends false \
   --firmware-binary false \
   --firmware-chroot false \
-  --iso-application "Leaf OS 3.0" \
+  --iso-application "Leaf OS ${VERSION}" \
   --iso-publisher "Leaf OS" \
-  --iso-volume "LEAFOS_3_0" \
+  --iso-volume "LEAFOS_${VERSION/./_}" \
   --bootappend-live "boot=live components quiet splash hostname=leafos username=leaf user-fullname=Leaf locales=${LOCALE} keyboard-layouts=${KEYBOARD} timezone=${TIMEZONE}"
 
 # ---- packages -----------------------------------------------------------------
@@ -87,12 +100,46 @@ locales
 keyboard-configuration
 console-setup
 tzdata
+librsvg2-common
+adwaita-icon-theme
+hicolor-icon-theme
+shared-mime-info
+gsettings-desktop-schemas
+dconf-gsettings-backend
+xdg-utils
+xdg-user-dirs
+zram-tools
+procps
 EOF
+# librsvg2-common ... xdg-user-dirs: without these, Chromium's "Save as" and file windows crash the
+#   whole browser (their icons can't be drawn). That was the "system crashes when downloading" bug.
+# zram-tools: compressed memory, so big downloads don't run the live system out of RAM.
 
 # ---- Leaf OS files ----------------------------------------------------------------
 INC=config/includes.chroot
-mkdir -p "$INC/opt/leafos" "$INC/etc/skel" "$INC/etc/chromium/policies/managed"
-cp "$ROOT/leafos/index.html" "$INC/opt/leafos/index.html"
+mkdir -p "$INC/opt/leafos/helper" "$INC/etc/skel/Downloads" "$INC/etc/skel/.config" \
+         "$INC/etc/chromium/policies/managed" "$INC/etc/default"
+cp "$(pick index.html)"   "$INC/opt/leafos/index.html"
+cp "$(pick server.py)"    "$INC/opt/leafos/server.py"
+cp "$(pick iso-extra.js)" "$INC/opt/leafos/iso-extra.js"
+for f in manifest.json background.js content.js; do
+    cp "$(pick "$f")" "$INC/opt/leafos/helper/$f"
+done
+chmod 755 "$INC/opt/leafos/server.py"
+# (only the page's real closing tag, which is alone on its line; Leaf OS has "</body>" inside some texts too)
+sed -i 's#^[[:space:]]*</body>[[:space:]]*$#<script src="iso-extra.js"></script>\n</body>#' "$INC/opt/leafos/index.html"
+grep -q 'src="iso-extra.js"' "$INC/opt/leafos/index.html" || { echo "Could not add iso-extra.js to index.html" >&2; exit 1; }
+touch "$INC/etc/skel/Downloads/.keep"
+cat > "$INC/etc/skel/.config/user-dirs.dirs" <<'EOF'
+XDG_DOWNLOAD_DIR="$HOME/Downloads"
+EOF
+
+# Compressed swap in memory
+cat > "$INC/etc/default/zramswap" <<'EOF'
+ALGO=zstd
+PERCENT=60
+PRIORITY=100
+EOF
 
 # ---- Networking: make sure the VM always gets online ----------------------------------
 mkdir -p "$INC/etc/NetworkManager/conf.d" "$INC/etc/NetworkManager/system-connections" \
@@ -170,232 +217,9 @@ cat > config/hooks/normal/0100-leafos-services.hook.chroot <<'EOF'
 systemctl enable NetworkManager.service || true
 systemctl enable leafos-netfix.service || true
 systemctl enable systemd-timesyncd.service || true
+systemctl enable zramswap.service || true
 EOF
 chmod 755 config/hooks/normal/0100-leafos-services.hook.chroot
-
-# ---- Local server: serves Leaf OS, power buttons, network check ------------------------
-cat > "$INC/opt/leafos/server.py" <<'EOF'
-#!/usr/bin/env python3
-"""Leaf OS ISO edition: serves the desktop on http://127.0.0.1:8080, handles the
-Shut down / Reboot buttons and the Terminal's netstatus / netfix commands."""
-import functools
-import http.server
-import os
-import subprocess
-
-ROOT = "/opt/leafos"
-CHECKS = [
-    ("network cards", ["ip", "-br", "link"]),
-    ("addresses", ["ip", "-4", "-br", "addr"]),
-    ("routes", ["ip", "route"]),
-    ("dns servers", ["cat", "/etc/resolv.conf"]),
-    ("networkmanager", ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"]),
-    ("dns lookup", ["getent", "hosts", "api.open-meteo.com"]),
-    ("https test", ["curl", "-sS", "-m", "8", "-o", "/dev/null", "-w", "HTTP %{http_code}\n", "https://api.open-meteo.com/v1/forecast?latitude=40&longitude=-3&current=temperature_2m"]),
-]
-
-
-def run(cmd, timeout=12):
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return (r.stdout + r.stderr).strip() or "(no output)"
-    except Exception as e:  # noqa: BLE001
-        return f"error: {e}"
-
-
-class LeafHandler(http.server.SimpleHTTPRequestHandler):
-    def send_text(self, text, code=200):
-        body = text.encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        if self.path == "/netstatus":
-            self.send_text("\n\n".join(f"== {t} ==\n{run(c)}" for t, c in CHECKS))
-        else:
-            super().do_GET()
-
-    def do_POST(self):
-        # The custom header blocks requests coming from other websites
-        if self.headers.get("X-Leaf") != "1":
-            self.send_text("forbidden", 403)
-            return
-        if self.path in ("/power/off", "/power/reboot"):
-            self.send_text("ok")
-            action = "poweroff" if self.path.endswith("off") else "reboot"
-            subprocess.Popen(["sudo", "-n", "systemctl", action])
-        elif self.path == "/open":
-            # Open a website in a real, separate Chromium window (logins, downloads, any site)
-            length = int(self.headers.get("Content-Length") or 0)
-            url = self.rfile.read(min(length, 4096)).decode("utf-8", "replace").strip()
-            if not (url.startswith("http://") or url.startswith("https://")):
-                self.send_text("bad url", 400)
-                return
-            try:
-                subprocess.Popen([
-                    "chromium", "--user-data-dir=" + os.path.expanduser("~/.leafos-web"),
-                    "--no-first-run", "--start-maximized", "--password-store=basic",
-                    "--disable-gpu", "--new-window", url,
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-                self.send_text("ok")
-            except OSError as e:
-                self.send_text(f"could not start chromium: {e}", 500)
-        elif self.path == "/netfix":
-            out = run(["sudo", "-n", "systemctl", "restart", "NetworkManager"], 20)
-            out += "\n" + run(["sudo", "-n", "/usr/local/sbin/leafos-netfix", "now"], 120)
-            self.send_text(out)
-        else:
-            self.send_text("not found", 404)
-
-    def end_headers(self):
-        self.send_header("Cache-Control", "no-store")
-        super().end_headers()
-
-    def log_message(self, *args):
-        pass
-
-
-if __name__ == "__main__":
-    handler = functools.partial(LeafHandler, directory=ROOT)
-    http.server.ThreadingHTTPServer(("127.0.0.1", 8080), handler).serve_forever()
-EOF
-chmod 755 "$INC/opt/leafos/server.py"
-
-# ---- Leaf OS additions for the ISO edition ---------------------------------------------
-cat > "$INC/opt/leafos/iso-extra.js" <<'EOF'
-// Leaf OS ISO edition extras (added by build.sh)
-(function () {
-    if (!(location.hostname === '127.0.0.1' || location.hostname === 'localhost')) return;
-
-    // Chromium inside a VM can wrongly report "offline", so trust the Wi-Fi switch instead
-    window.isOsOnline = function () { return Boolean(osSettings.wifi && !osSettings.airplane); };
-
-    async function netstatus() {
-        try { return await (await fetch('/netstatus', { cache: 'no-store' })).text(); }
-        catch (e) { return 'Could not run the network check: ' + e.message; }
-    }
-
-    // Terminal commands: netstatus (show connection details) and netfix (reconnect)
-    const baseCmd = window.execCmdExtra;
-    window.execCmdExtra = async function (cmd, arg, out, hist) {
-        if (cmd === 'netstatus' || cmd === 'ifconfig') {
-            out.textContent = 'Checking the network...';
-            out.textContent = await netstatus();
-            hist.scrollTop = hist.scrollHeight;
-            return true;
-        }
-        if (cmd === 'netfix') {
-            out.textContent = 'Reconnecting the network (up to 1 minute)...';
-            try {
-                const r = await fetch('/netfix', { method: 'POST', headers: { 'X-Leaf': '1' } });
-                await r.text();
-            } catch (e) { /* ignore */ }
-            await refreshLiveNetworkInfo(false);
-            out.textContent = liveNet.ip && liveNet.ip !== 'Unavailable'
-                ? 'Connected! Public IP: ' + liveNet.ip
-                : 'Still offline. Type netstatus and send a photo of the result.';
-            hist.scrollTop = hist.scrollHeight;
-            return true;
-        }
-        return baseCmd(cmd, arg, out, hist);
-    };
-
-    // ---- Websites ----------------------------------------------------------------------
-    // The ISO's browser extension removes the "refused to connect" block, so Direct view
-    // can show almost any website inside Leaf Edge. Make it the default.
-    osSettings.browserMode = 'frame';
-    edgeState.readerMode = false;
-
-    // Open a site in a real Chromium window (for logins, downloads, games)
-    window.leafOpenReal = function (url) {
-        url = String(url || '').trim();
-        if (!/^https?:\/\//i.test(url)) url = 'https://www.google.com/search?q=' + encodeURIComponent(url);
-        showToast('Opening in Chromium: ' + url.replace(/^https?:\/\//, '').slice(0, 60));
-        fetch('/open', { method: 'POST', headers: { 'X-Leaf': '1' }, body: url }).catch(() => {});
-    };
-    window.addEventListener('click', e => {
-        const a = e.target.closest ? e.target.closest('a[target="_blank"]') : null;
-        if (a && /^https?:/i.test(a.href)) {
-            e.preventDefault();
-            e.stopPropagation();
-            leafOpenReal(a.href);
-        }
-    }, true);
-    window.open = url => { if (url) leafOpenReal(String(url)); return null; };
-
-    // Leaf Edge: clearer button names and a less restricted page frame
-    const baseRenderBrowser = window.renderBrowserHTML;
-    window.renderBrowserHTML = function () {
-        return baseRenderBrowser().replace('Open Tab &#8599;', 'Open in Chromium &#8599;');
-    };
-    const baseRenderPage = window.renderEdgePage;
-    window.renderEdgePage = function (url) {
-        return baseRenderPage(url)
-            .replace('sandbox="allow-scripts allow-same-origin allow-forms"',
-                'sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-downloads allow-pointer-lock allow-presentation allow-storage-access-by-user-activation" allow="fullscreen; autoplay; encrypted-media; clipboard-write"')
-            .replace('Blank page? This site blocks embedding. Use <strong>Reader view</strong> or <strong>Open Tab</strong>.',
-                'If this site needs you to log in, click <strong>Open in Chromium</strong> in the toolbar.');
-    };
-
-    // ---- More terminal commands ----------------------------------------------------------
-    const baseCmd2 = window.execCmdExtra;
-    window.execCmdExtra = async function (cmd, arg, out, hist) {
-        if (cmd === 'chromium' || cmd === 'browser' || cmd === 'chrome') {
-            leafOpenReal(arg || 'https://www.google.com');
-            out.textContent = 'Opening Chromium...';
-            return true;
-        }
-        return baseCmd2(cmd, arg, out, hist);
-    };
-
-    // A few seconds after start-up, warn if the internet can't be reached
-    window.addEventListener('load', () => {
-        setTimeout(async () => {
-            await refreshLiveNetworkInfo(false);
-            if (!liveNet.ip || liveNet.ip === 'Unavailable') {
-                showToast('No internet yet. Open Terminal and type netfix (or netstatus for details).', true);
-            }
-        }, 9000);
-    });
-})();
-EOF
-sed -i 's#</body>#<script src="iso-extra.js"></script>\n</body>#' "$INC/opt/leafos/index.html"
-
-# ---- Browser extension: lets Leaf Edge show sites that "refuse to connect" in a frame ---
-mkdir -p "$INC/opt/leafos/ext"
-cat > "$INC/opt/leafos/ext/manifest.json" <<'EOF'
-{
-  "manifest_version": 3,
-  "name": "Leaf Edge Frame Helper",
-  "version": "1.0",
-  "description": "Allows websites to open inside Leaf Edge on Leaf OS.",
-  "permissions": ["declarativeNetRequest"],
-  "host_permissions": ["<all_urls>"],
-  "declarative_net_request": {
-    "rule_resources": [{ "id": "frames", "enabled": true, "path": "rules.json" }]
-  }
-}
-EOF
-cat > "$INC/opt/leafos/ext/rules.json" <<'EOF'
-[
-  {
-    "id": 1,
-    "priority": 1,
-    "action": {
-      "type": "modifyHeaders",
-      "responseHeaders": [
-        { "header": "x-frame-options", "operation": "remove" },
-        { "header": "content-security-policy", "operation": "remove" },
-        { "header": "content-security-policy-report-only", "operation": "remove" }
-      ]
-    },
-    "condition": { "resourceTypes": ["sub_frame"] }
-  }
-]
-EOF
 
 # Log in automatically on the first console and start the graphical session
 cat > "$INC/etc/skel/.bash_profile" <<'EOF'
@@ -404,31 +228,41 @@ if [ -z "${DISPLAY:-}" ] && [ "$(tty)" = "/dev/tty1" ]; then
 fi
 EOF
 
-# The graphical session: Leaf OS full screen, restarted automatically if closed
+# The graphical session: Leaf OS full screen, restarted automatically if it ever stops.
+# Chromium's messages go to ~/.leafos-chromium.log, and crashes are noted for the "crashlog" command.
 cat > "$INC/etc/skel/.xinitrc" <<EOF
 #!/bin/sh
 xset s off -dpms s noblank 2>/dev/null
 OUT=\$(xrandr 2>/dev/null | awk '/ connected/{print \$1; exit}')
 [ -n "\$OUT" ] && xrandr --output "\$OUT" --mode ${SCREEN} 2>/dev/null
+mkdir -p "\$HOME/Downloads"
 openbox &
-python3 /opt/leafos/server.py &
+python3 /opt/leafos/server.py >> "\$HOME/.leafos-server.log" 2>&1 &
 sleep 1
+LOG="\$HOME/.leafos-chromium.log"
 while true; do
+    [ -f "\$LOG" ] && [ "\$(stat -c %s "\$LOG")" -gt 2000000 ] && mv -f "\$LOG" "\$LOG.old"
+    echo "=== Leaf OS started \$(date '+%F %T') ===" >> "\$LOG"
     chromium --kiosk --app=http://127.0.0.1:8080/index.html \\
         --user-data-dir="\$HOME/.leafos-browser" \\
         --no-first-run --noerrdialogs --disable-infobars \\
         --disable-session-crashed-bubble --disable-translate \\
         --password-store=basic --autoplay-policy=no-user-gesture-required \\
         --check-for-update-interval=31536000 --overscroll-history-navigation=0 \\
-        --disable-pinch --disable-gpu \\
-        --load-extension=/opt/leafos/ext \\
-        --disable-features=Translate,MediaRouter,DisableLoadExtensionCommandLineSwitch
+        --disable-pinch --disable-gpu --disk-cache-size=33554432 \\
+        --load-extension=/opt/leafos/helper \\
+        --disable-features=Translate,MediaRouter,DisableLoadExtensionCommandLineSwitch \\
+        >> "\$LOG" 2>&1
+    CODE=\$?
+    echo "=== Leaf OS stopped (code \$CODE) \$(date '+%F %T') ===" >> "\$LOG"
+    [ "\$CODE" -ne 0 ] && date +%s >> "\$HOME/.leafos-crashes"
     sleep 1
 done
 EOF
 chmod 755 "$INC/etc/skel/.xinitrc"
 
-# Quiet, private browser defaults
+# Browser rules: downloads go straight to ~/Downloads (no "Save as" window), no blocking
+# warnings for programs and archives, and quiet, private defaults.
 cat > "$INC/etc/chromium/policies/managed/leafos.json" <<'EOF'
 {
   "BrowserSignin": 0,
@@ -438,7 +272,26 @@ cat > "$INC/etc/chromium/policies/managed/leafos.json" <<'EOF'
   "MetricsReportingEnabled": false,
   "PromotionalTabsEnabled": false,
   "DefaultBrowserSettingEnabled": false,
-  "BackgroundModeEnabled": false
+  "BackgroundModeEnabled": false,
+  "CommandLineFlagSecurityWarningsEnabled": false,
+  "DownloadDirectory": "/home/leaf/Downloads",
+  "PromptForDownloadLocation": false,
+  "DownloadRestrictions": 0,
+  "ExemptDomainFileTypePairsFromFileTypeDownloadWarnings": [
+    { "file_extension": "exe", "domains": ["*"] },
+    { "file_extension": "msi", "domains": ["*"] },
+    { "file_extension": "zip", "domains": ["*"] },
+    { "file_extension": "7z", "domains": ["*"] },
+    { "file_extension": "rar", "domains": ["*"] },
+    { "file_extension": "jar", "domains": ["*"] },
+    { "file_extension": "apk", "domains": ["*"] },
+    { "file_extension": "bat", "domains": ["*"] },
+    { "file_extension": "com", "domains": ["*"] },
+    { "file_extension": "dmg", "domains": ["*"] },
+    { "file_extension": "deb", "domains": ["*"] },
+    { "file_extension": "iso", "domains": ["*"] },
+    { "file_extension": "jsdos", "domains": ["*"] }
+  ]
 }
 EOF
 
@@ -446,7 +299,7 @@ EOF
 if [ -d /usr/share/live/build/bootloaders/isolinux ]; then
     mkdir -p config/bootloaders
     cp -r /usr/share/live/build/bootloaders/isolinux config/bootloaders/
-    grep -rl "Live system" config/bootloaders 2>/dev/null | xargs -r sed -i 's/Live system/Leaf OS 3.0/g' || true
+    grep -rl "Live system" config/bootloaders 2>/dev/null | xargs -r sed -i "s/Live system/Leaf OS ${VERSION}/g" || true
     grep -rl "^timeout" config/bootloaders 2>/dev/null | xargs -r sed -i 's/^timeout .*/timeout 50/' || true
 fi
 
@@ -454,6 +307,8 @@ echo "==> Building the ISO (this takes 15-30 minutes)"
 lb build
 
 ISO=$(ls -1 ./*.iso | head -n1)
-mv "$ISO" "$ROOT/out/leafos-3.0-amd64.iso"
+mv "$ISO" "$ROOT/out/leafos-${VERSION}-amd64.iso"
+# Same file under the old name too, so an older copy of the GitHub workflow still finds it
+ln -f "$ROOT/out/leafos-${VERSION}-amd64.iso" "$ROOT/out/leafos-3.0-amd64.iso"
 ls -lh "$ROOT/out/"
-echo "==> Done: out/leafos-3.0-amd64.iso"
+echo "==> Done: out/leafos-${VERSION}-amd64.iso"

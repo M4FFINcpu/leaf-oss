@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Leaf OS Web Helper",
+  "version": "1.0.1",
+  "description": "Lets the Chromium app inside Leaf OS show real websites. It only changes pages shown inside Leaf OS.",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "declarativeNetRequestWithHostAccess",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_end",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_title": "Leaf OS Web Helper (click on a Leaf OS page to allow it there)"
+  }
+}
