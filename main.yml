@@ -11,29 +11,53 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+      - name: Free disk space (the full desktop needs about 25 GB while building)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+                      /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /usr/local/share/powershell || true
+          docker image prune -af || true
+          df -h /
 
       - name: Build the ISO in a Debian 12 container
         run: |
           DIR=.
           [ -f build.sh ] || DIR=leafos-iso-kit
           docker run --rm --privileged -v "$PWD/$DIR":/build -w /build debian:bookworm bash ./build.sh
-          mkdir -p out
-          cp "$DIR"/out/leafos-4.5-amd64.iso out/
+          sudo mkdir -p out
+          sudo mv "$DIR"/out/leafos-5.0-amd64.iso out/
+          sudo rm -rf "$DIR/work"
+
+      - name: Split the ISO if it is bigger than GitHub's 2 GB file limit
+        run: |
+          cd out
+          ISO=leafos-5.0-amd64.iso
+          sudo chown "$(id -u)" "$ISO"
+          sha256sum "$ISO" > "$ISO.sha256"
+          if [ "$(stat -c %s "$ISO")" -gt 2000000000 ]; then
+            split -b 1900m -d -a 1 "$ISO" "$ISO.part"
+            rm "$ISO"
+            PARTS=$(ls "$ISO".part* | tr '\n' ' ')
+            printf '@echo off\r\necho Joining the Leaf OS ISO parts...\r\ncopy /b %s %s\r\necho Done: %s\r\npause\r\n' \
+              "$(echo $PARTS | sed 's/ / + /g')" "$ISO" "$ISO" > join-iso-windows.bat
+            printf '#!/bin/sh\ncat %s > %s\necho Done: %s\n' "$PARTS" "$ISO" "$ISO" > join-iso-linux-mac.sh
+          fi
+          ls -lh
 
       - name: Publish the ISO as a release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: leafos-4.5-build-${{ github.run_number }}
-          name: Leaf OS 4.5 ISO (build ${{ github.run_number }})
+          tag_name: leafos-5.0-build-${{ github.run_number }}
+          name: Leaf OS 5.0 (build ${{ github.run_number }})
           body: |
-            Bootable Leaf OS 4.5 for VirtualBox, USB sticks and PCs. Download leafos-4.5-amd64.iso below.
-            New: Leaf OS 4.5 desktop (Windows 10 style, Chromium with tabs and real websites, EXE Runner, Weather, Alarms & Clock, Sticky Notes),
-            a Downloads app, and a fix for the crash when downloading files.
-          files: out/leafos-4.5-amd64.iso
+            Leaf OS 5.0: a full desktop Linux (Debian 12 + KDE Plasma) you can install on a drive.
+            Steam, Wine, Lutris, Firefox, Chromium, LibreOffice, VLC, GIMP, Discover app store with Flatpak, and the Leaf OS web desktop.
+
+            If the ISO comes in parts (.part0, .part1...), download all parts and the join script,
+            put them in one folder and run join-iso-windows.bat (Windows) or join-iso-linux-mac.sh.
+            leafos-5.0-amd64.iso.sha256 lets you check the finished file.
+          files: out/*
           fail_on_unmatched_files: true

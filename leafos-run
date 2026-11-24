@@ -1,0 +1,70 @@
+#!/bin/bash
+# Leaf OS Runner: open, install or run almost any downloaded file.
+#   .AppImage .deb .flatpak .exe/.msi .sh/.run and archives (.tar.gz .tar.xz .zip .7z ...)
+# Archives are unpacked into ~/Apps/<name>; if a program is inside, it is started.
+f="$1"
+[ -f "$f" ] || { echo "Usage: leafos-run FILE"; exit 1; }
+f="$(readlink -f "$f")"
+name="$(basename "$f")"
+lower="${name,,}"
+say() { notify-send -i system-run "Leaf OS" "$1" 2>/dev/null || echo "$1"; }
+
+start_program() {   # $1 = folder: find something to start inside it
+    local dir="$1" run=""
+    run=$(find "$dir" -maxdepth 3 -type f -iname '*.appimage' | head -n1)
+    if [ -z "$run" ]; then
+        while IFS= read -r x; do
+            if file -b "$x" | grep -q 'ELF.*executable\|ELF.*pie'; then run="$x"; break; fi
+        done < <(find "$dir" -maxdepth 3 -type f -perm -u+x ! -name '*.so*' 2>/dev/null | sort)
+    fi
+    if [ -z "$run" ]; then
+        run=$(find "$dir" -maxdepth 2 -type f \( -iname 'start*.sh' -o -iname 'run*.sh' -o -iname '*launch*.sh' \) | head -n1)
+    fi
+    if [ -n "$run" ]; then
+        chmod +x "$run" 2>/dev/null
+        say "Starting $(basename "$run")"
+        cd "$(dirname "$run")" && exec "$run"
+    fi
+    if [ -f "$dir/configure" ] || [ -f "$dir/Makefile" ] || [ -f "$dir/CMakeLists.txt" ] || [ -f "$dir/meson.build" ]; then
+        exec konsole --workdir "$dir" -e bash -c 'echo "This is source code. To build and install it, type:"; \
+            [ -f configure ] && echo "  ./configure && make && sudo make install"; \
+            [ -f CMakeLists.txt ] && echo "  cmake -B build && cmake --build build && sudo cmake --install build"; \
+            [ -f meson.build ] && echo "  meson setup build && ninja -C build && sudo ninja -C build install"; \
+            [ -f Makefile ] && [ ! -f configure ] && echo "  make && sudo make install"; echo; exec bash'
+    fi
+    say "Unpacked $name. Nothing to start inside, so here are the files."
+    exec dolphin "$dir"
+}
+
+case "$lower" in
+    *.appimage)
+        chmod +x "$f"; exec "$f" ;;
+    *.deb)
+        exec gdebi-gtk "$f" ;;
+    *.flatpakref|*.flatpak|*.flatpakrepo)
+        exec plasma-discover "$f" ;;
+    *.exe|*.msi|*.bat)
+        exec wine start /unix "$f" ;;
+    *.sh|*.run|*.bin)
+        chmod +x "$f"; exec konsole --hold --workdir "$(dirname "$f")" -e "$f" ;;
+    *.tar.gz|*.tgz|*.tar.xz|*.txz|*.tar.bz2|*.tbz2|*.tbz|*.tar.zst|*.tzst|*.tar|*.zip|*.7z|*.rar)
+        base="$name"
+        for ext in .tar.gz .tgz .tar.xz .txz .tar.bz2 .tbz2 .tbz .tar.zst .tzst .tar .zip .7z .rar; do
+            if [[ "$lower" == *"$ext" ]]; then base="${name:0:${#name}-${#ext}}"; break; fi
+        done
+        dest="$HOME/Apps/$base"
+        mkdir -p "$dest"
+        say "Unpacking $name into Apps/$base"
+        case "$lower" in
+            *.zip) unzip -oq "$f" -d "$dest" ;;
+            *.7z)  7z x -y -o"$dest" "$f" >/dev/null ;;
+            *.rar) unar -q -f -o "$dest" "$f" >/dev/null ;;
+            *)     tar -xf "$f" -C "$dest" ;;
+        esac || { say "Could not unpack $name"; exit 1; }
+        inner=$(find "$dest" -mindepth 1 -maxdepth 1)
+        if [ "$(printf '%s\n' "$inner" | wc -l)" = 1 ] && [ -d "$inner" ]; then dest="$inner"; fi
+        start_program "$dest" ;;
+    *)
+        if file -b "$f" | grep -q 'ELF'; then chmod +x "$f"; exec "$f"; fi
+        exec xdg-open "$f" ;;
+esac
