@@ -28,7 +28,7 @@ jobs:
           [ -f build.sh ] || DIR=leafos-iso-kit
           docker run --rm --privileged -v "$PWD/$DIR":/build -w /build debian:bookworm bash ./build.sh
           sudo mkdir -p out
-          sudo mv "$DIR"/out/leafos-5.0-amd64.iso out/
+                    [ "$DIR" = "." ] || sudo mv "$DIR"/out/leafos-5.0-amd64.iso out/
           sudo rm -rf "$DIR/work"
 
       - name: Split the ISO if it is bigger than GitHub's 2 GB file limit
